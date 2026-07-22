@@ -82,3 +82,23 @@ def test_lancedb_crud_search_and_filters():
 
         store.reset()
         assert store.col_info()["count"] == 0
+
+
+def test_lancedb_dot_distance_similarity_direction():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store = LanceDB(
+            collection_name="memories",
+            path=temp_dir,
+            embedding_model_dims=3,
+            distance="dot",
+        )
+
+        store.insert(
+            vectors=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            ids=["perfect", "orthogonal"],
+        )
+
+        results = store.search(query="", vectors=[1.0, 0.0, 0.0], top_k=2)
+        assert results[0].id == "perfect"
+        assert results[0].score > results[1].score
+        assert results[0].score == pytest.approx(1.0)

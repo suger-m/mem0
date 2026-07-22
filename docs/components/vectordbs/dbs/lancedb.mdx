@@ -68,4 +68,4 @@ LanceDB in Mem0 supports three distance metrics. Search results are returned as 
 
 - **cosine**: Cosine distance converted with `score = max(0.0, 1.0 - distance)`
 - **l2**: Euclidean distance converted with `score = 1.0 / (1.0 + distance)`
-- **dot**: Inner product / dot similarity (already higher = better)
+- **dot**: Inner product distance converted with `score = 1.0 - distance`

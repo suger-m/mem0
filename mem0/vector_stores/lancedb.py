@@ -72,8 +72,6 @@ class LanceDB(VectorStoreBase):
     def _load_payload(payload: Optional[str]) -> Dict:
         if not payload:
             return {}
-        if isinstance(payload, dict):
-            return payload
         try:
             return json.loads(payload)
         except json.JSONDecodeError:
@@ -112,15 +110,13 @@ class LanceDB(VectorStoreBase):
             return None
         raw_score = float(raw_score)
         if self.distance == "dot":
-            return raw_score
+            return 1.0 - raw_score
         if self.distance == "cosine":
             return max(0.0, 1.0 - raw_score)
         return 1.0 / (1.0 + raw_score)
 
     def _parse_row(self, row: Dict) -> OutputData:
         raw_score = row.get("_distance")
-        if raw_score is None:
-            raw_score = row.get("_score")
         return OutputData(
             id=row.get("id"),
             score=self._score_from_distance(raw_score),
@@ -203,10 +199,8 @@ class LanceDB(VectorStoreBase):
         self.insert(vectors=[vector], payloads=[next_payload or {}], ids=[vector_id])
 
     def get(self, vector_id: str) -> Optional[OutputData]:
-        for row in self.table.to_arrow().to_pylist():
-            if row.get("id") == vector_id:
-                return self._parse_row(row)
-        return None
+        rows = self.table.search().where(self._id_where(vector_id)).limit(1).to_list()
+        return self._parse_row(rows[0]) if rows else None
 
     def list_cols(self) -> List[str]:
         return self._table_names()
