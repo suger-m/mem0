@@ -79,28 +79,87 @@ class LanceDB(VectorStoreBase):
             return {}
 
     @staticmethod
-    def _apply_filters(payload: Dict, filters: Optional[Dict]) -> bool:
+    def _matches_filter_value(actual, expected) -> bool:
+        if expected == "*":
+            return True
+
+        if isinstance(expected, list):
+            return actual in expected
+
+        if not isinstance(expected, dict):
+            return actual == expected
+
+        supported_operators = {
+            "eq",
+            "ne",
+            "gt",
+            "gte",
+            "lt",
+            "lte",
+            "in",
+            "nin",
+            "contains",
+            "icontains",
+        }
+        unsupported = set(expected) - supported_operators
+        if unsupported:
+            raise ValueError(f"Unsupported filter operator(s): {sorted(unsupported)}")
+
+        for operator, value in expected.items():
+            try:
+                if operator == "eq" and actual != value:
+                    return False
+                if operator == "ne" and actual == value:
+                    return False
+                if operator == "gt" and actual <= value:
+                    return False
+                if operator == "gte" and actual < value:
+                    return False
+                if operator == "lt" and actual >= value:
+                    return False
+                if operator == "lte" and actual > value:
+                    return False
+                if operator == "in" and actual not in value:
+                    return False
+                if operator == "nin" and actual in value:
+                    return False
+                if operator == "contains" and value not in actual:
+                    return False
+                if operator == "icontains" and str(value).lower() not in str(actual).lower():
+                    return False
+            except TypeError:
+                return False
+
+        return True
+
+    @classmethod
+    def _apply_filters(cls, payload: Dict, filters: Optional[Dict]) -> bool:
         if not filters:
             return True
         if not payload:
             return False
 
         for key, expected in filters.items():
+            if key in {"$and", "$or", "$not"}:
+                if not isinstance(expected, list) or not all(isinstance(item, dict) for item in expected):
+                    raise ValueError(f"{key} filter value must be a list of filter dictionaries")
+
+                matches = [cls._apply_filters(payload, item) for item in expected]
+                if key == "$and" and not all(matches):
+                    return False
+                if key == "$or" and not any(matches):
+                    return False
+                if key == "$not" and any(matches):
+                    return False
+                continue
+
+            if key.startswith("$"):
+                raise ValueError(f"Unsupported logical filter operator: {key}")
+
             if key not in payload:
                 return False
 
-            actual = payload[key]
-            if isinstance(expected, list):
-                if actual not in expected:
-                    return False
-            elif isinstance(expected, dict):
-                if "eq" in expected and actual != expected["eq"]:
-                    return False
-                if "in" in expected and actual not in expected["in"]:
-                    return False
-                if not any(op in expected for op in ("eq", "in")):
-                    return False
-            elif actual != expected:
+            if not cls._matches_filter_value(payload[key], expected):
                 return False
 
         return True
@@ -163,19 +222,32 @@ class LanceDB(VectorStoreBase):
         self, query: str, vectors: List[list], top_k: int = 5, filters: Optional[Dict] = None
     ) -> List[OutputData]:
         query_vector = vectors[0] if vectors and isinstance(vectors[0], list) else vectors
-        fetch_k = max(top_k * 5, 50) if filters else top_k
+        if not filters:
+            rows = self.table.search(query_vector).metric(self.distance).limit(top_k).to_list()
+            return [self._parse_row(row) for row in rows]
 
-        rows = self.table.search(query_vector).metric(self.distance).limit(fetch_k).to_list()
+        table_size = self.table.count_rows()
+        if table_size == 0:
+            return []
 
-        results: List[OutputData] = []
-        for row in rows:
-            parsed = self._parse_row(row)
-            if filters and not self._apply_filters(parsed.payload or {}, filters):
-                continue
-            results.append(parsed)
-            if len(results) >= top_k:
-                break
-        return results
+        # LanceDB 0.17 cannot query arbitrary fields inside the JSON payload.
+        # Grow the vector recall window until enough filtered matches are found
+        # so a selective filter cannot silently under-return top_k results.
+        fetch_k = min(max(top_k * 5, 50), table_size)
+        while True:
+            rows = self.table.search(query_vector).metric(self.distance).limit(fetch_k).to_list()
+            results: List[OutputData] = []
+            for row in rows:
+                parsed = self._parse_row(row)
+                if self._apply_filters(parsed.payload or {}, filters):
+                    results.append(parsed)
+                    if len(results) >= top_k:
+                        break
+
+            if len(results) >= top_k or fetch_k >= table_size:
+                return results[:top_k]
+
+            fetch_k = min(fetch_k * 2, table_size)
 
     def delete(self, vector_id: str):
         self.table.delete(self._id_where(vector_id))
@@ -188,7 +260,7 @@ class LanceDB(VectorStoreBase):
     ):
         existing = self.get(vector_id)
         if existing is None:
-            raise ValueError(f"Vector {vector_id} not found")
+            return
 
         next_payload = payload if payload is not None else existing.payload
         if vector is None:

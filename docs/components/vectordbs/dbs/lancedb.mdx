@@ -59,7 +59,7 @@ Here are the parameters available for configuring LanceDB:
 
 1. **Local persistence**: Vectors and payloads are stored under `path`. Persist that directory (or mount a volume in Docker) so data survives process restarts.
 2. **Single-writer deployments**: LanceDB local mode is best for one writer. Avoid multiple processes writing to the same database path concurrently.
-3. **Metadata filters**: Simple equality / `in` filters are applied after vector recall in Python. Complex operators such as `$and` / `$or` are not fully supported in the first version.
+3. **Metadata filters**: LanceDB supports Mem0's equality, list / `in`, wildcard, logical `AND` / `OR` / `NOT`, comparison, and string containment filters. To preserve arbitrary metadata keys while remaining compatible with LanceDB 0.17, filters are evaluated in Python after vector recall. Search expands the recall window until it finds `top_k` matches or reaches the end of the table, so highly selective filters can scan the full table and may be slower on large collections.
 4. **Embedding dimensions**: If you change `embedding_model_dims`, create a new table or rebuild the store. Existing tables keep the dimension they were created with.
 
 ### Distance Metrics
