@@ -16,6 +16,10 @@ from mem0.vector_stores.base import VectorStoreBase
 
 logger = logging.getLogger(__name__)
 
+_FILTER_OPERATORS = {"eq", "ne", "gt", "gte", "lt", "lte", "in", "nin", "contains", "icontains"}
+_LOGICAL_FILTER_ALIASES = {"AND": "$and", "OR": "$or", "NOT": "$not"}
+_LOGICAL_FILTER_OPERATORS = {"$and", "$or", "$not"}
+
 
 class OutputData(BaseModel):
     id: Optional[str]
@@ -89,19 +93,7 @@ class LanceDB(VectorStoreBase):
         if not isinstance(expected, dict):
             return actual == expected
 
-        supported_operators = {
-            "eq",
-            "ne",
-            "gt",
-            "gte",
-            "lt",
-            "lte",
-            "in",
-            "nin",
-            "contains",
-            "icontains",
-        }
-        unsupported = set(expected) - supported_operators
+        unsupported = set(expected) - _FILTER_OPERATORS
         if unsupported:
             raise ValueError(f"Unsupported filter operator(s): {sorted(unsupported)}")
 
@@ -133,23 +125,69 @@ class LanceDB(VectorStoreBase):
         return True
 
     @classmethod
+    def _validate_filters(cls, filters: Dict) -> None:
+        if not isinstance(filters, dict):
+            raise ValueError("Filters must be a dictionary")
+
+        for key, expected in filters.items():
+            if not isinstance(key, str):
+                raise ValueError("Filter field names must be strings")
+
+            logical_key = _LOGICAL_FILTER_ALIASES.get(key, key)
+            if logical_key in _LOGICAL_FILTER_OPERATORS:
+                if not isinstance(expected, list) or not all(isinstance(item, dict) for item in expected):
+                    raise ValueError(f"{logical_key} filter value must be a list of filter dictionaries")
+                for item in expected:
+                    cls._validate_filters(item)
+                continue
+
+            if key.startswith("$"):
+                raise ValueError(f"Unsupported logical filter operator: {key}")
+
+            if not isinstance(expected, dict):
+                continue
+            if not expected:
+                raise ValueError(f"Operator filter for field {key!r} must not be empty")
+
+            unsupported = set(expected) - _FILTER_OPERATORS
+            if unsupported:
+                raise ValueError(f"Unsupported filter operator(s): {sorted(unsupported)}")
+
+            for operator, value in expected.items():
+                if operator in {"eq", "ne", "gt", "gte", "lt", "lte"}:
+                    if isinstance(value, (dict, list, tuple, set)):
+                        raise ValueError(f"Filter operator {operator!r} requires a scalar value")
+                    if operator in {"gt", "gte", "lt", "lte"} and value is None:
+                        raise ValueError(f"Filter operator {operator!r} does not support null")
+                    continue
+
+                if operator in {"in", "nin"}:
+                    if not isinstance(value, (list, tuple)) or not value:
+                        raise ValueError(f"Filter operator {operator!r} requires a non-empty list")
+                    if any(isinstance(item, (dict, list, tuple, set)) for item in value):
+                        raise ValueError(f"Filter operator {operator!r} list items must be scalar values")
+                    continue
+
+                if not isinstance(value, str):
+                    raise ValueError(f"Filter operator {operator!r} requires a string value")
+
+    @classmethod
     def _apply_filters(cls, payload: Dict, filters: Optional[Dict]) -> bool:
         if not filters:
             return True
-        if not payload:
-            return False
 
         for key, expected in filters.items():
-            if key in {"$and", "$or", "$not"}:
+            logical_key = _LOGICAL_FILTER_ALIASES.get(key, key)
+            if logical_key in _LOGICAL_FILTER_OPERATORS:
                 if not isinstance(expected, list) or not all(isinstance(item, dict) for item in expected):
-                    raise ValueError(f"{key} filter value must be a list of filter dictionaries")
+                    raise ValueError(f"{logical_key} filter value must be a list of filter dictionaries")
 
                 matches = [cls._apply_filters(payload, item) for item in expected]
-                if key == "$and" and not all(matches):
+                if logical_key == "$and" and not all(matches):
                     return False
-                if key == "$or" and not any(matches):
+                if logical_key == "$or" and not any(matches):
                     return False
-                if key == "$not" and any(matches):
+                if logical_key == "$not" and any(matches):
                     return False
                 continue
 
@@ -221,6 +259,11 @@ class LanceDB(VectorStoreBase):
     def search(
         self, query: str, vectors: List[list], top_k: int = 5, filters: Optional[Dict] = None
     ) -> List[OutputData]:
+        if filters:
+            self._validate_filters(filters)
+        if top_k == 0:
+            return []
+
         query_vector = vectors[0] if vectors and isinstance(vectors[0], list) else vectors
         if not filters:
             rows = self.table.search(query_vector).metric(self.distance).limit(top_k).to_list()
@@ -292,6 +335,11 @@ class LanceDB(VectorStoreBase):
         }
 
     def list(self, filters: Optional[Dict] = None, top_k: int = 100) -> List[List[OutputData]]:
+        if filters:
+            self._validate_filters(filters)
+        if top_k == 0:
+            return [[]]
+
         rows = self.table.to_arrow().to_pylist()
         results: List[OutputData] = []
         for row in rows:

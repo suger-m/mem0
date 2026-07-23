@@ -164,6 +164,50 @@ def test_lancedb_list_supports_processed_metadata_filters(populated_filter_store
     assert {result.id for result in results} == {"m1", "m3"}
 
 
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"user_id": "alice", "AND": [{"score": {"gte": 7}}, {"category": "work"}]},
+        {"user_id": "alice", "OR": [{"category": "work"}, {"score": {"gt": 9}}]},
+        {"user_id": "alice", "NOT": [{"category": "personal"}]},
+    ],
+)
+def test_lancedb_list_supports_unprocessed_logical_filter_aliases(populated_filter_store, filters):
+    results = populated_filter_store.list(filters=filters, top_k=10)[0]
+
+    assert {result.id for result in results} == {"m1"}
+
+
+def test_lancedb_not_matches_payloads_missing_the_negated_field(tmp_path):
+    store = LanceDB(
+        collection_name="missing_field_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+    store.insert(
+        vectors=[[1.0, 0.0], [0.0, 1.0]],
+        ids=["missing", "work"],
+        payloads=[{}, {"category": "work"}],
+    )
+
+    results = store.list(filters={"$not": [{"category": "work"}]}, top_k=10)[0]
+
+    assert {result.id for result in results} == {"missing"}
+
+
+def test_lancedb_search_returns_no_results_when_top_k_is_zero(populated_filter_store):
+    results = populated_filter_store.search(query="", vectors=[1.0, 0.0], top_k=0)
+
+    assert results == []
+
+
+def test_lancedb_list_returns_no_results_when_top_k_is_zero(populated_filter_store):
+    results = populated_filter_store.list(top_k=0)
+
+    assert results == [[]]
+
+
 def test_lancedb_search_expands_recall_until_top_k_filtered_results_are_found(tmp_path):
     store = LanceDB(
         collection_name="recall_memories",
@@ -197,6 +241,39 @@ def test_lancedb_search_rejects_unknown_filter_operator(populated_filter_store):
             top_k=3,
             filters={"score": {"between": [3, 7]}},
         )
+
+
+@pytest.mark.parametrize("operation", ["search", "list"])
+def test_lancedb_rejects_unknown_filter_operator_when_table_is_empty(tmp_path, operation):
+    store = LanceDB(
+        collection_name="empty_filter_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+    filters = {"score": {"between": [3, 7]}}
+
+    with pytest.raises(ValueError, match="Unsupported filter operator"):
+        if operation == "search":
+            store.search(query="", vectors=[1.0, 0.0], top_k=3, filters=filters)
+        else:
+            store.list(filters=filters, top_k=3)
+
+
+@pytest.mark.parametrize(
+    ("filters", "error"),
+    [
+        ({"score": {}}, "must not be empty"),
+        ({"user_id": {"in": "alice,bob"}}, "requires a non-empty list"),
+        ({"user_id": {"nin": []}}, "requires a non-empty list"),
+        ({"name": {"contains": 1}}, "requires a string value"),
+        ({"score": {"gt": [6]}}, "requires a scalar value"),
+        ({"score": {"gte": None}}, "does not support null"),
+    ],
+)
+def test_lancedb_rejects_invalid_filter_operands(populated_filter_store, filters, error):
+    with pytest.raises(ValueError, match=error):
+        populated_filter_store.list(filters=filters, top_k=10)
 
 
 def test_lancedb_update_missing_id_is_a_noop(tmp_path):
