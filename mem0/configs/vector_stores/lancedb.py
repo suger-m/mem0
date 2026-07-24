@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class LanceDBConfig(BaseModel):
     collection_name: str = Field("mem0", description="Default name for the table")
     path: Optional[str] = Field("/tmp/lancedb", description="Path to the LanceDB database directory")
-    embedding_model_dims: int = Field(1536, description="Dimension of the embedding vector")
+    embedding_model_dims: int = Field(1536, gt=0, description="Dimension of the embedding vector")
     distance: str = Field("cosine", description="Distance metric. Options: 'cosine', 'l2', 'dot'")
 
     @model_validator(mode="before")

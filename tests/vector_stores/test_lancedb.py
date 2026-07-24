@@ -1,4 +1,7 @@
+import builtins
+import importlib.util
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -6,6 +9,24 @@ pytest.importorskip("lancedb")
 
 from mem0.vector_stores.configs import VectorStoreConfig
 from mem0.vector_stores.lancedb import LanceDB
+from mem0.utils.factory import VectorStoreFactory
+
+
+def test_lancedb_import_error_mentions_vector_stores_extra(monkeypatch):
+    real_import = builtins.__import__
+
+    def fail_lancedb_import(name, *args, **kwargs):
+        if name == "lancedb":
+            raise ImportError("No module named 'lancedb'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_lancedb_import)
+    module_path = Path(__file__).parents[2] / "mem0" / "vector_stores" / "lancedb.py"
+    spec = importlib.util.spec_from_file_location("missing_lancedb_test_module", module_path)
+    module = importlib.util.module_from_spec(spec)
+
+    with pytest.raises(ImportError, match="mem0ai\\[vector-stores\\]"):
+        spec.loader.exec_module(module)
 
 
 @pytest.fixture
@@ -44,6 +65,47 @@ def test_lancedb_config_accepts_local_settings():
     assert config.config.collection_name == "memories"
     assert config.config.embedding_model_dims == 3
     assert config.config.distance == "cosine"
+
+
+def test_lancedb_factory_creates_a_persistent_store(tmp_path):
+    config = VectorStoreConfig(
+        provider="lancedb",
+        config={
+            "path": str(tmp_path),
+            "collection_name": "factory_memories",
+            "embedding_model_dims": 2,
+            "distance": "cosine",
+        },
+    )
+
+    store = VectorStoreFactory.create("lancedb", config.config)
+
+    assert isinstance(store, LanceDB)
+    assert store.col_info() == {
+        "name": "factory_memories",
+        "count": 0,
+        "dimension": 2,
+        "distance": "cosine",
+    }
+
+
+@pytest.mark.parametrize("embedding_model_dims", [0, -1])
+def test_lancedb_config_rejects_non_positive_embedding_dimensions(embedding_model_dims):
+    with pytest.raises(ValueError, match="greater than 0"):
+        VectorStoreConfig(
+            provider="lancedb",
+            config={"embedding_model_dims": embedding_model_dims},
+        )
+
+
+@pytest.mark.parametrize("embedding_model_dims", [0, -1])
+def test_lancedb_rejects_non_positive_embedding_dimensions_when_constructed_directly(tmp_path, embedding_model_dims):
+    with pytest.raises(ValueError, match="embedding_model_dims must be a positive integer"):
+        LanceDB(
+            collection_name="invalid_dimension_memories",
+            path=str(tmp_path),
+            embedding_model_dims=embedding_model_dims,
+        )
 
 
 def test_lancedb_crud_search_and_filters():
@@ -102,6 +164,109 @@ def test_lancedb_crud_search_and_filters():
 
         store.reset()
         assert store.col_info()["count"] == 0
+
+
+def test_lancedb_reopens_an_existing_collection(tmp_path):
+    first = LanceDB(
+        collection_name="persisted_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+    first.insert(vectors=[[1.0, 0.0]], ids=["m1"], payloads=[{"value": "persisted"}])
+
+    reopened = LanceDB(
+        collection_name="persisted_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+
+    assert reopened.get("m1").payload == {"value": "persisted"}
+
+
+def test_lancedb_list_cols_returns_all_collection_names(tmp_path):
+    expected_names = [f"memories_{index:02d}" for index in range(12)]
+    store = None
+    for name in expected_names:
+        store = LanceDB(
+            collection_name=name,
+            path=str(tmp_path),
+            embedding_model_dims=2,
+            distance="cosine",
+        )
+
+    assert store.list_cols() == expected_names
+
+
+def test_lancedb_delete_col_removes_the_collection(tmp_path):
+    store = LanceDB(
+        collection_name="deleted_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+
+    store.delete_col()
+
+    assert store.table is None
+    assert "deleted_memories" not in store.list_cols()
+
+
+def test_lancedb_create_col_switches_the_active_collection(tmp_path):
+    store = LanceDB(
+        collection_name="first_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+    store.insert(vectors=[[1.0, 0.0]], ids=["first"], payloads=[{"collection": "first"}])
+
+    store.create_col("second_memories")
+    store.insert(vectors=[[0.0, 1.0]], ids=["second"], payloads=[{"collection": "second"}])
+
+    assert store.col_info()["name"] == "second_memories"
+    assert store.col_info()["count"] == 1
+    assert store.get("second").payload == {"collection": "second"}
+    assert store.client.open_table("first_memories").count_rows() == 1
+
+
+def test_lancedb_rejects_existing_collection_dimension_mismatch(tmp_path):
+    LanceDB(
+        collection_name="dimensioned_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+
+    with pytest.raises(ValueError, match="uses embedding dimension 2.*requested 3"):
+        LanceDB(
+            collection_name="dimensioned_memories",
+            path=str(tmp_path),
+            embedding_model_dims=3,
+            distance="cosine",
+        )
+
+
+def test_lancedb_failed_collection_switch_preserves_the_active_collection(tmp_path):
+    store = LanceDB(
+        collection_name="stable_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+    store.insert(vectors=[[1.0, 0.0]], ids=["m1"], payloads=[{"stable": True}])
+
+    with pytest.raises(ValueError, match="uses embedding dimension 2.*requested 3"):
+        store.create_col("stable_memories", vector_size=3, distance="l2")
+
+    assert store.col_info() == {
+        "name": "stable_memories",
+        "count": 1,
+        "dimension": 2,
+        "distance": "cosine",
+    }
+    assert store.get("m1").payload == {"stable": True}
 
 
 def test_lancedb_dot_distance_similarity_direction():
@@ -208,6 +373,52 @@ def test_lancedb_list_returns_no_results_when_top_k_is_zero(populated_filter_sto
     assert results == [[]]
 
 
+@pytest.mark.parametrize("top_k", [-1, 1.5, None, True])
+@pytest.mark.parametrize("operation", ["search", "list"])
+def test_lancedb_rejects_invalid_top_k_before_querying_an_empty_table(tmp_path, operation, top_k):
+    store = LanceDB(
+        collection_name="invalid_top_k_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+
+    with pytest.raises(ValueError, match="top_k must be a non-negative integer"):
+        if operation == "search":
+            store.search(query="", vectors=[1.0, 0.0], top_k=top_k)
+        else:
+            store.list(top_k=top_k)
+
+
+@pytest.mark.parametrize("operation", ["search", "list"])
+def test_lancedb_rejects_non_dictionary_filters_even_when_empty(tmp_path, operation):
+    store = LanceDB(
+        collection_name="invalid_filter_type_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+
+    with pytest.raises(ValueError, match="Filters must be a dictionary"):
+        if operation == "search":
+            store.search(query="", vectors=[1.0, 0.0], filters=[])
+        else:
+            store.list(filters=[])
+
+
+@pytest.mark.parametrize("filters", [None, {"user_id": "alice"}])
+def test_lancedb_rejects_invalid_query_vector_before_searching_an_empty_table(tmp_path, filters):
+    store = LanceDB(
+        collection_name="invalid_query_vector_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+
+    with pytest.raises(ValueError, match="Vector has dimension 3.*expects 2"):
+        store.search(query="", vectors=[1.0, 0.0, 0.0], filters=filters)
+
+
 def test_lancedb_search_expands_recall_until_top_k_filtered_results_are_found(tmp_path):
     store = LanceDB(
         collection_name="recall_memories",
@@ -287,3 +498,87 @@ def test_lancedb_update_missing_id_is_a_noop(tmp_path):
     store.update("missing", payload={"user_id": "alice"})
 
     assert store.col_info()["count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("vector", "payload", "error"),
+    [
+        ([1.0, 0.0, 0.0], {"safe": False}, ValueError),
+        (["not-a-number", 0.0], {"safe": False}, ValueError),
+        ([0.0, 1.0], {"bad": {1, 2}}, TypeError),
+    ],
+)
+def test_lancedb_failed_vector_update_preserves_the_existing_record(tmp_path, vector, payload, error):
+    store = LanceDB(
+        collection_name="safe_update_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+    store.insert(vectors=[[1.0, 0.0]], ids=["m1"], payloads=[{"safe": True}])
+
+    with pytest.raises(error):
+        store.update("m1", vector=vector, payload=payload)
+
+    assert store.get("m1").payload == {"safe": True}
+
+
+def test_lancedb_vector_only_update_preserves_the_existing_payload(tmp_path):
+    store = LanceDB(
+        collection_name="vector_only_update_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+    store.insert(vectors=[[1.0, 0.0]], ids=["m1"], payloads=[{"safe": True}])
+
+    store.update("m1", vector=[0.0, 1.0])
+
+    assert store.get("m1").payload == {"safe": True}
+    assert store.search(query="", vectors=[0.0, 1.0], top_k=1)[0].id == "m1"
+
+
+@pytest.mark.parametrize("payload", [[], ["invalid"], "invalid", 1])
+def test_lancedb_insert_rejects_non_dictionary_payloads(tmp_path, payload):
+    store = LanceDB(
+        collection_name="invalid_insert_payload_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+
+    with pytest.raises(TypeError, match="Payload must be a dictionary or None"):
+        store.insert(vectors=[[1.0, 0.0]], ids=["m1"], payloads=[payload])
+
+    assert store.col_info()["count"] == 0
+
+
+@pytest.mark.parametrize("payload", [[], ["invalid"], "invalid", 1])
+def test_lancedb_update_rejects_non_dictionary_payloads_without_modifying_the_record(tmp_path, payload):
+    store = LanceDB(
+        collection_name="invalid_update_payload_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+    store.insert(vectors=[[1.0, 0.0]], ids=["m1"], payloads=[{"safe": True}])
+
+    with pytest.raises(TypeError, match="Payload must be a dictionary or None"):
+        store.update("m1", payload=payload)
+
+    assert store.get("m1").payload == {"safe": True}
+
+
+def test_lancedb_reads_legacy_non_dictionary_payload_as_empty_metadata(tmp_path, caplog):
+    store = LanceDB(
+        collection_name="legacy_payload_memories",
+        path=str(tmp_path),
+        embedding_model_dims=2,
+        distance="cosine",
+    )
+    store.table.add([{"id": "m1", "vector": [1.0, 0.0], "payload": '["legacy"]'}])
+
+    result = store.get("m1")
+
+    assert result.payload == {}
+    assert "must decode to a dictionary" in caplog.text

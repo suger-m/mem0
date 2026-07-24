@@ -10,7 +10,10 @@ try:
     import lancedb
     import pyarrow as pa
 except ImportError:
-    raise ImportError("The 'lancedb' library is required. Please install it using 'pip install lancedb'.")
+    raise ImportError(
+        "The 'lancedb' library is required. Please install it using "
+        "'pip install \"mem0ai[vector-stores]\"' or 'pip install lancedb'."
+    )
 
 from mem0.vector_stores.base import VectorStoreBase
 
@@ -35,6 +38,7 @@ class LanceDB(VectorStoreBase):
         embedding_model_dims: int = 1536,
         distance: str = "cosine",
     ):
+        self._validate_embedding_dimension(embedding_model_dims)
         self.collection_name = collection_name
         self.path = path or "/tmp/lancedb"
         self.embedding_model_dims = embedding_model_dims
@@ -44,11 +48,12 @@ class LanceDB(VectorStoreBase):
         self.client = lancedb.connect(self.path)
         self.table = self.create_col(collection_name)
 
-    def _schema(self):
+    def _schema(self, vector_size: Optional[int] = None):
+        dimension = self.embedding_model_dims if vector_size is None else vector_size
         return pa.schema(
             [
                 pa.field("id", pa.string()),
-                pa.field("vector", pa.list_(pa.float32(), self.embedding_model_dims)),
+                pa.field("vector", pa.list_(pa.float32(), dimension)),
                 pa.field("payload", pa.string()),
             ]
         )
@@ -56,9 +61,28 @@ class LanceDB(VectorStoreBase):
     def _table_names(self) -> List[str]:
         list_tables = getattr(self.client, "list_tables", None)
         if callable(list_tables):
-            return list_tables()
-        table_names = self.client.table_names()
-        return table_names() if callable(table_names) else table_names
+            names: List[str] = []
+            page_token = None
+            while True:
+                response = list_tables(page_token=page_token)
+                names.extend(getattr(response, "tables", response))
+                page_token = getattr(response, "page_token", None)
+                if not page_token:
+                    return names
+
+        table_names = self.client.table_names
+        if not callable(table_names):
+            return list(table_names)
+
+        names: List[str] = []
+        page_token = None
+        page_size = 100
+        while True:
+            page = list(table_names(page_token=page_token, limit=page_size))
+            names.extend(page)
+            if len(page) < page_size:
+                return names
+            page_token = page[-1]
 
     @staticmethod
     def _escape_sql_string(value: str) -> str:
@@ -70,17 +94,44 @@ class LanceDB(VectorStoreBase):
 
     @staticmethod
     def _dump_payload(payload: Optional[Dict]) -> str:
-        return json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
+        if payload is None:
+            payload = {}
+        elif not isinstance(payload, dict):
+            raise TypeError("Payload must be a dictionary or None")
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def _normalize_vector(self, vector: List[float]) -> List[float]:
+        normalized = [float(value) for value in vector]
+        if len(normalized) != self.embedding_model_dims:
+            raise ValueError(
+                f"Vector has dimension {len(normalized)}, but LanceDB collection {self.collection_name!r} "
+                f"expects {self.embedding_model_dims}"
+            )
+        return normalized
+
+    @staticmethod
+    def _validate_top_k(top_k: int) -> None:
+        if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < 0:
+            raise ValueError("top_k must be a non-negative integer")
+
+    @staticmethod
+    def _validate_embedding_dimension(dimension: int) -> None:
+        if not isinstance(dimension, int) or dimension <= 0:
+            raise ValueError("embedding_model_dims must be a positive integer")
 
     @staticmethod
     def _load_payload(payload: Optional[str]) -> Dict:
         if not payload:
             return {}
         try:
-            return json.loads(payload)
-        except json.JSONDecodeError:
+            loaded = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
             logger.warning("Failed to decode LanceDB payload JSON")
             return {}
+        if not isinstance(loaded, dict):
+            logger.warning("LanceDB payload JSON must decode to a dictionary")
+            return {}
+        return loaded
 
     @staticmethod
     def _matches_filter_value(actual, expected) -> bool:
@@ -221,16 +272,26 @@ class LanceDB(VectorStoreBase):
         )
 
     def create_col(self, name: str, vector_size: Optional[int] = None, distance: Optional[str] = None):
-        if vector_size:
-            self.embedding_model_dims = vector_size
-        if distance:
-            self.distance = distance
+        next_dimension = self.embedding_model_dims if vector_size is None else vector_size
+        next_distance = self.distance if distance is None else distance
+        self._validate_embedding_dimension(next_dimension)
+
+        if name in self._table_names():
+            table = self.client.open_table(name)
+            existing_dimension = getattr(table.schema.field("vector").type, "list_size", None)
+            if existing_dimension != next_dimension:
+                raise ValueError(
+                    f"LanceDB collection {name!r} uses embedding dimension {existing_dimension}, "
+                    f"but requested {next_dimension}"
+                )
+        else:
+            table = self.client.create_table(name, schema=self._schema(next_dimension))
 
         self.collection_name = name
-        if name in self._table_names():
-            return self.client.open_table(name)
-
-        return self.client.create_table(name, schema=self._schema())
+        self.embedding_model_dims = next_dimension
+        self.distance = next_distance
+        self.table = table
+        return table
 
     def insert(
         self,
@@ -248,7 +309,7 @@ class LanceDB(VectorStoreBase):
         rows = [
             {
                 "id": vector_id,
-                "vector": [float(value) for value in vector],
+                "vector": self._normalize_vector(vector),
                 "payload": self._dump_payload(payload),
             }
             for vector_id, vector, payload in zip(ids, vectors, payloads)
@@ -259,12 +320,14 @@ class LanceDB(VectorStoreBase):
     def search(
         self, query: str, vectors: List[list], top_k: int = 5, filters: Optional[Dict] = None
     ) -> List[OutputData]:
-        if filters:
+        self._validate_top_k(top_k)
+        if filters is not None:
             self._validate_filters(filters)
         if top_k == 0:
             return []
 
         query_vector = vectors[0] if vectors and isinstance(vectors[0], list) else vectors
+        query_vector = self._normalize_vector(query_vector)
         if not filters:
             rows = self.table.search(query_vector).metric(self.distance).limit(top_k).to_list()
             return [self._parse_row(row) for row in rows]
@@ -305,13 +368,15 @@ class LanceDB(VectorStoreBase):
         if existing is None:
             return
 
-        next_payload = payload if payload is not None else existing.payload
-        if vector is None:
-            self.table.update(where=self._id_where(vector_id), values={"payload": self._dump_payload(next_payload)})
+        values = {}
+        if vector is not None:
+            values["vector"] = self._normalize_vector(vector)
+        if payload is not None:
+            values["payload"] = self._dump_payload(payload)
+        if not values:
             return
 
-        self.delete(vector_id)
-        self.insert(vectors=[vector], payloads=[next_payload or {}], ids=[vector_id])
+        self.table.update(where=self._id_where(vector_id), values=values)
 
     def get(self, vector_id: str) -> Optional[OutputData]:
         rows = self.table.search().where(self._id_where(vector_id)).limit(1).to_list()
@@ -335,7 +400,8 @@ class LanceDB(VectorStoreBase):
         }
 
     def list(self, filters: Optional[Dict] = None, top_k: int = 100) -> List[List[OutputData]]:
-        if filters:
+        self._validate_top_k(top_k)
+        if filters is not None:
             self._validate_filters(filters)
         if top_k == 0:
             return [[]]
